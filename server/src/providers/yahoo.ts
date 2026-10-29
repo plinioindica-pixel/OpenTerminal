@@ -50,7 +50,15 @@ export type Quote = {
   source: string;
 };
 
-export type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
+export type Candle = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  adjClose?: number;
+  volume: number;
+};
 
 // ---- crumb/cookie session (needed for the v7 quote and options endpoints) ----
 
@@ -224,13 +232,29 @@ export async function history(symbol: string, range: string, interval: string): 
   const result = json?.chart?.result?.[0];
   if (!result) throw new Error("yahoo: no chart data for " + symbol);
   const ts: number[] = result.timestamp ?? [];
-  const q = result.indicators?.quote?.[0] ?? {};
-  const candles: Candle[] = [];
-  for (let i = 0; i < ts.length; i++) {
-    const [o, h, l, c] = [q.open?.[i], q.high?.[i], q.low?.[i], q.close?.[i]];
-    if (o == null || h == null || l == null || c == null) continue;
-    candles.push({ time: ts[i], open: o, high: h, low: l, close: c, volume: q.volume?.[i] ?? 0 });
-  }
+const q = result.indicators?.quote?.[0] ?? {};
+const adjusted = result.indicators?.adjclose?.[0]?.adjclose ?? [];
+const candles: Candle[] = [];
+
+for (let i = 0; i < ts.length; i++) {
+  const [o, h, l, c] = [q.open?.[i], q.high?.[i], q.low?.[i], q.close?.[i]];
+
+  if (o == null || h == null || l == null || c == null) continue;
+
+  const adjClose = adjusted[i];
+
+  candles.push({
+    time: ts[i],
+    open: o,
+    high: h,
+    low: l,
+    close: c,
+    ...(typeof adjClose === "number" && Number.isFinite(adjClose)
+      ? { adjClose }
+      : {}),
+    volume: q.volume?.[i] ?? 0,
+  });
+}
   return candles;
 }
 

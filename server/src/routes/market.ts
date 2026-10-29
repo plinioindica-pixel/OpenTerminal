@@ -3,6 +3,7 @@ import { cached, cacheGet, cacheStore, staleGet } from "../cache.js";
 import { withFallback } from "../providers/registry.js";
 import * as yahoo from "../providers/yahoo.js";
 import * as stooq from "../providers/stooq.js";
+import * as brapi from "../providers/brapi.js";
 import * as nasdaq from "../providers/nasdaq.js";
 import * as fred from "../providers/fred.js";
 import * as ecb from "../providers/ecb.js";
@@ -114,15 +115,35 @@ const FALLBACK_PER_SYMBOL_CAP = 20;
 async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
   const fresh = new Map<string, yahoo.Quote>();
   const missing: string[] = [];
+
   for (const sym of symbols) {
     const hit = cacheGet<yahoo.Quote>(`quote:${sym}`);
-    if (hit) fresh.set(sym, hit);
-    else missing.push(sym);
+    if (hit) {
+      fresh.set(sym, hit);
+    } else {
+      missing.push(sym);
+    }
   }
+
   if (missing.length === 0) return symbols.map((s) => fresh.get(s)!).filter(Boolean);
+
 
   const fetched = new Map<string, yahoo.Quote>();
   let remaining = missing;
+
+  const brazilianAliases = new Map<string, string>();
+
+  remaining = remaining.map((sym) => {
+    if (sym.endsWith(".SA")) return sym;
+
+    if (/^[A-Z]{4}\d{1,2}$/.test(sym)) {
+      const yahooSymbol = `${sym}.SA`;
+      brazilianAliases.set(yahooSymbol, sym);
+      return yahooSymbol;
+    }
+
+    return sym;
+  });
 
   const cryptoSymbols = remaining.filter((s) => binance.CRYPTO_SYMBOLS.has(s));
   if (cryptoSymbols.length > 0) {
@@ -142,21 +163,79 @@ async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
     remaining = remaining.filter((s) => !fetched.has(s));
   }
 
-  const nasdaqResults = await Promise.allSettled(remaining.map((s) => nasdaq.quote(s)));
-  nasdaqResults.forEach((r, i) => {
-    if (r.status === "fulfilled") fetched.set(remaining[i], r.value);
-  });
-  remaining = remaining.filter((s) => !fetched.has(s));
+
+
+  // Brazilian stocks and ETFs try brapi first, then retain the existing
+  // Yahoo chart and Stooq fallback flow.
+  const brazilianSymbols = remaining.filter((s) => s.endsWith(".SA"));
+
+  if (brazilianSymbols.length > 0) {
+    try {
+      const rows = await brapi.quotes(brazilianSymbols);
+
+      for (const q of rows) {
+        const yahooSymbol = `${q.symbol}.SA`;
+        const normalizedQuote = { ...q, symbol: yahooSymbol };
+
+        fetched.set(yahooSymbol, normalizedQuote);
+
+        const originalSymbol = brazilianAliases.get(yahooSymbol);
+        if (originalSymbol) {
+          fetched.set(originalSymbol, {
+            ...normalizedQuote,
+            symbol: originalSymbol,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn("[market] brapi quotes unavailable; trying fallback providers");
+    }
+
+    remaining = remaining.filter((s) => !fetched.has(s));
+  }
+
+
+  const nasdaqSymbols = remaining.filter((s) => !s.endsWith(".SA"));
+  if (nasdaqSymbols.length > 0) {
+    const nasdaqResults = await Promise.allSettled(
+      nasdaqSymbols.map((s) => nasdaq.quote(s)),
+    );
+
+    nasdaqResults.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        fetched.set(nasdaqSymbols[i], r.value);
+      }
+    });
+
+    remaining = remaining.filter((s) => !fetched.has(s));
+  }
+
+
 
   if (remaining.length > 0) {
     try {
       const rows = await yahoo.quotes(remaining);
-      for (const q of rows) fetched.set(q.symbol, q);
-      remaining = remaining.filter((s) => !fetched.has(s));
+
+      for (const q of rows) {
+        fetched.set(q.symbol, q);
+
+        const originalSymbol = brazilianAliases.get(q.symbol);
+        if (originalSymbol) {
+          fetched.set(originalSymbol, {
+            ...q,
+            symbol: originalSymbol,
+          });
+        }
+      }
+
+      remaining = remaining.filter(
+        (s) => !fetched.has(s) && !fetched.has(brazilianAliases.get(s) ?? ""),
+      );
     } catch {
       // fall through to chart-based per-symbol fetch below
     }
   }
+
 
   if (remaining.length > 0) {
     const batch = remaining.slice(0, FALLBACK_PER_SYMBOL_CAP);
@@ -199,7 +278,9 @@ async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
     }
   }
 
-  for (const [sym, q] of fetched) cacheStore(`quote:${sym}`, q, QUOTE_TTL);
+    for (const [sym, q] of fetched) {
+      cacheStore(`quote:${sym}`, q, QUOTE_TTL);
+  }
 
   const out: yahoo.Quote[] = [];
   for (const sym of symbols) {
@@ -209,40 +290,85 @@ async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
   return out;
 }
 
+
 marketRouter.get("/quotes", async (req, res) => {
-  const symbols = String(req.query.symbols ?? "")
-    .split(",")
-    .map((s) => s.trim().toUpperCase())
-    .filter(Boolean)
-    .slice(0, 150);
-  if (symbols.length === 0) return res.status(400).json({ error: "symbols required" });
+  const symbols = [
+    ...new Set(
+      String(req.query.symbols ?? "")
+        .split(",")
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter(Boolean),
+    ),
+  ].slice(0, 150);
+
+  if (symbols.length === 0) {
+    return res.status(400).json({ error: "symbols required" });
+  }
+
   try {
     const data = await getQuotes(symbols);
-    if (data.length === 0) throw new Error("no quotes from any provider");
-    res.json(data);
+
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error("no quotes from any provider");
+    }
+
+    return res.json(data);
   } catch (err) {
-    fail(req, res, err);
+    return fail(req, res, err);
   }
 });
 
+
 // ---- history / candles ----
+
 
 marketRouter.get("/history/:symbol", async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
+  const yahooSymbol =
+    /^[A-Z]{4}\d{1,2}$/.test(symbol) ? `${symbol}.SA` : symbol;
   const rangeKey = String(req.query.range ?? "6M");
+
   try {
-    const data = await cached(`history:${symbol}:${rangeKey}`, HISTORY_TTL, () =>
-      binance.CRYPTO_SYMBOLS.has(symbol)
-        ? binance.history(symbol, rangeKey)
-        : isVix(symbol)
-        ? vixHistory(rangeKey)
-        : withFallback([
-            ["nasdaq", () => nasdaq.history(symbol, rangeKey)],
-            ["yahoo", () => yahoo.history(symbol, yahooRange(rangeKey).range, yahooRange(rangeKey).interval)],
-            ["stooq", () => stooq.history(symbol)],
-          ])
+    const data = await cached(
+      `history:${symbol}:${rangeKey}`,
+      HISTORY_TTL,
+      () => {
+        if (binance.CRYPTO_SYMBOLS.has(symbol)) {
+          return binance.history(symbol, rangeKey);
+        }
+
+        if (isVix(symbol)) {
+          return vixHistory(rangeKey);
+        }
+
+        const range = yahooRange(rangeKey);
+
+
+        // Brazilian stocks and ETFs try brapi first, with Yahoo and Stooq
+        // retained as fallbacks.
+        if (symbol.endsWith(".SA") || yahooSymbol.endsWith(".SA")) {
+          return withFallback([
+            ["brapi", () => brapi.history(symbol, range.range, range.interval)],
+            ["yahoo", () =>
+              yahoo.history(yahooSymbol, range.range, range.interval)],
+            ["stooq", () => stooq.history(yahooSymbol)],
+          ]);
+        }
+
+
+        return withFallback([
+          ["nasdaq", () => nasdaq.history(symbol, rangeKey)],
+          ["yahoo", () =>
+            yahoo.history(symbol, range.range, range.interval)],
+          ["stooq", () => stooq.history(symbol)],
+        ]);
+      },
     );
-    if (!Array.isArray(data) || data.length === 0) throw new Error("empty history from all providers");
+
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error("empty history from all providers");
+    }
+
     res.json(data);
   } catch (err) {
     fail(req, res, err);
